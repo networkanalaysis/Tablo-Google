@@ -7,13 +7,14 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.TabloRepository
 import com.example.data.local.AppDatabase
 import com.example.data.local.SavedMultiviewRepository
-import com.example.data.remote.TabloApiClient
-import com.example.data.remote.TabloDiscoveryManager
+import com.example.data.local.TabloDeviceRepository
+import com.example.model.GuideTiming
 import com.example.model.MultiviewLayoutType
 import com.example.model.SavedMultiviewItem
 import com.example.model.TabloAiring
 import com.example.model.TabloChannel
 import com.example.model.TabloDevice
+import com.example.model.TabloResult
 import com.example.playback.MultiviewPlayerManager
 import com.example.ui.components.TvScreenSection
 import kotlinx.coroutines.Job
@@ -28,15 +29,17 @@ import kotlinx.coroutines.launch
 class TabloViewModel(application: Application) : AndroidViewModel(application) {
     private val database = AppDatabase.getInstance(application)
     private val savedRepository = SavedMultiviewRepository(database.savedMultiviewDao())
+    private val deviceRepository = TabloDeviceRepository(database.tabloDeviceDao())
     private val tabloRepository = TabloRepository()
-    private val discoveryManager = TabloDiscoveryManager()
 
-    val playerManager = MultiviewPlayerManager(application)
+    val playerManager = MultiviewPlayerManager(application) { tileIndex, _ ->
+        _tileErrors.value = _tileErrors.value + (tileIndex to STREAM_ERROR_MESSAGE)
+    }
 
     val savedMultiviews: StateFlow<List<SavedMultiviewItem>> = savedRepository.savedMultiviews
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    private val _currentSection = MutableStateFlow(TvScreenSection.MULTIVIEW)
+    private val _currentSection = MutableStateFlow(TvScreenSection.TABLO)
     val currentSection: StateFlow<TvScreenSection> = _currentSection.asStateFlow()
 
     private val _currentLayout = MutableStateFlow(MultiviewLayoutType.GRID_2X2)
@@ -56,8 +59,8 @@ class TabloViewModel(application: Application) : AndroidViewModel(application) {
     private val _airings = MutableStateFlow<List<TabloAiring>>(emptyList())
     val airings: StateFlow<List<TabloAiring>> = _airings.asStateFlow()
 
-    private val _activeMultiviewChannels = MutableStateFlow<List<TabloChannel>>(emptyList())
-    val activeMultiviewChannels: StateFlow<List<TabloChannel>> = _activeMultiviewChannels.asStateFlow()
+    private val _activeMultiviewChannels = MutableStateFlow<List<TabloChannel?>>(emptyTileSlots())
+    val activeMultiviewChannels: StateFlow<List<TabloChannel?>> = _activeMultiviewChannels.asStateFlow()
 
     private val _tabloDevice = MutableStateFlow<TabloDevice?>(null)
     val tabloDevice: StateFlow<TabloDevice?> = _tabloDevice.asStateFlow()
@@ -68,43 +71,140 @@ class TabloViewModel(application: Application) : AndroidViewModel(application) {
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
+    private val _isConnecting = MutableStateFlow(false)
+    val isConnecting: StateFlow<Boolean> = _isConnecting.asStateFlow()
+
+    private val _isLoggingIn = MutableStateFlow(false)
+    val isLoggingIn: StateFlow<Boolean> = _isLoggingIn.asStateFlow()
+
+    private val _loginError = MutableStateFlow<String?>(null)
+    val loginError: StateFlow<String?> = _loginError.asStateFlow()
+
+    private val _isLoadingChannels = MutableStateFlow(false)
+    val isLoadingChannels: StateFlow<Boolean> = _isLoadingChannels.asStateFlow()
+
+    private val _isLoadingGuide = MutableStateFlow(false)
+    val isLoadingGuide: StateFlow<Boolean> = _isLoadingGuide.asStateFlow()
+
+    private val _channelError = MutableStateFlow<String?>(null)
+    val channelError: StateFlow<String?> = _channelError.asStateFlow()
+
+    private val _guideError = MutableStateFlow<String?>(null)
+    val guideError: StateFlow<String?> = _guideError.asStateFlow()
+
+    private val _connectionError = MutableStateFlow<String?>(null)
+    val connectionError: StateFlow<String?> = _connectionError.asStateFlow()
+
+    private val _tileErrors = MutableStateFlow<Map<Int, String>>(emptyMap())
+    val tileErrors: StateFlow<Map<Int, String>> = _tileErrors.asStateFlow()
+
+    private val _isPlaying = MutableStateFlow(true)
+    val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
+
     private var autoHideJob: Job? = null
+    private var lastManualIp: String? = null
+    private var dataLoadJob: Job? = null
 
     init {
-        initializeInitialSetup()
+        viewModelScope.launch {
+            val savedDevice = deviceRepository.load()
+            if (savedDevice != null) {
+                _tabloDevice.value = savedDevice
+                _currentSection.value = TvScreenSection.GUIDE
+                loadChannelsAndGuide(savedDevice)
+            } else {
+                _currentSection.value = TvScreenSection.TABLO
+            }
+        }
     }
 
-    private fun initializeInitialSetup() {
-        viewModelScope.launch {
-            // Load demo / initial channels and airings from repository
-            val initialChannels = tabloRepository.getMockChannels()
-            val initialAirings = tabloRepository.getMockGuideAirings()
-            val defaultDevice = tabloRepository.getDemoDevice()
+    private fun loadChannelsAndGuide(device: TabloDevice) {
+        dataLoadJob?.cancel()
+        dataLoadJob = viewModelScope.launch {
+            _isLoadingChannels.value = true
+            _channelError.value = null
+            _guideError.value = null
+            try {
+                when (val result = tabloRepository.fetchLiveChannels(device)) {
+                    is TabloResult.Error -> {
+                        _channelError.value = result.message
+                        _connectionError.value = result.message
+                        _isLoadingChannels.value = false
+                        _currentSection.value = TvScreenSection.TABLO
+                    }
+                    is TabloResult.Success -> {
+                        _channels.value = result.data
+                        _channelError.value = null
+                        _connectionError.value = null
+                        _isLoadingChannels.value = false
 
-            _channels.value = initialChannels
-            _airings.value = initialAirings
-            _tabloDevice.value = defaultDevice
-            _discoveredDevices.value = listOf(defaultDevice)
+                        viewModelScope.launch {
+                            val (active, total) = tabloRepository.fetchTunerStatus(device)
+                            _tabloDevice.value = _tabloDevice.value?.copy(
+                                activeTuners = active,
+                                tunerCount = total,
+                                isConnected = true
+                            )
+                        }
 
-            // Populate initial 4 channels for 2x2 multiview
-            val top4 = initialChannels.take(4)
-            _activeMultiviewChannels.value = top4
+                        // Requirement: Do not fill in the multiview by default.
+                        // Multiview starts empty; user picks initial channel in TV Guide.
+                        _activeMultiviewChannels.value = emptyTileSlots()
+                        _currentLayout.value = MultiviewLayoutType.SOLO
 
-            // Start playing the streams with smooth staggered decoder allocation
-            top4.forEachIndexed { index, channel ->
-                if (index == 0) {
-                    playerManager.playChannel(index, channel, channel.streamUrl)
-                } else {
-                    viewModelScope.launch {
-                        delay(150L * index)
-                        playerManager.playChannel(index, channel, channel.streamUrl)
+                        loadGuide(device, result.data)
                     }
                 }
+            } catch (e: Exception) {
+                Log.e("TabloViewModel", "Load data failed: ${e.message}")
+                _connectionError.value = "The Tablo did not respond. Check that it is powered on and connected."
+                _isLoadingChannels.value = false
+                _currentSection.value = TvScreenSection.TABLO
             }
-            playerManager.setAudioTile(0)
+        }
+    }
 
-            // Trigger background discovery for any live hardware Tablos
-            startDiscovery()
+    private fun loadGuide(device: TabloDevice, channels: List<TabloChannel>) {
+        viewModelScope.launch {
+            _isLoadingGuide.value = true
+            _guideError.value = null
+            val now = System.currentTimeMillis()
+            val windowStart = GuideTiming.windowStartMs(now)
+            val windowEnd = GuideTiming.windowEndMs(now)
+            when (val result = tabloRepository.fetchGuideAirings(
+                device,
+                channels.map { it.channelId },
+                windowStart,
+                windowEnd
+            )) {
+                is TabloResult.Error -> {
+                    _guideError.value = result.message
+                    _airings.value = emptyList()
+                }
+                is TabloResult.Success -> {
+                    _airings.value = result.data
+                    _guideError.value = null
+                }
+            }
+            _isLoadingGuide.value = false
+        }
+    }
+
+    private fun playChannelInTile(channel: TabloChannel, tileIndex: Int) {
+        val device = _tabloDevice.value ?: return
+        val slots = _activeMultiviewChannels.value.toMutableList()
+        while (slots.size <= tileIndex) slots.add(null)
+        slots[tileIndex] = channel
+        _activeMultiviewChannels.value = slots
+
+        _tileErrors.value = _tileErrors.value - tileIndex
+        viewModelScope.launch {
+            val url = tabloRepository.fetchWatchStreamUrl(device, channel)
+            if (url.isNullOrEmpty()) {
+                _tileErrors.value = _tileErrors.value + (tileIndex to STREAM_ERROR_MESSAGE)
+            } else {
+                playerManager.playChannel(tileIndex, channel, url)
+            }
         }
     }
 
@@ -140,6 +240,9 @@ class TabloViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setSection(section: TvScreenSection) {
+        if (section == TvScreenSection.GUIDE && _airings.value.isEmpty() && _guideError.value == null) {
+            _tabloDevice.value?.let { device -> loadGuide(device, _channels.value) }
+        }
         _currentSection.value = section
         if (section == TvScreenSection.MULTIVIEW) {
             resetAutoHideQuickBar()
@@ -179,29 +282,78 @@ class TabloViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun tuneChannelFullscreen(channel: TabloChannel) {
-        val currentList = _activeMultiviewChannels.value.toMutableList()
-        val index = _focusedTileIndex.value
-        if (index < currentList.size) {
-            currentList[index] = channel
-        } else {
-            currentList.add(channel)
+        val targetIndex = 0
+        // Free decoders and resources on other tiles
+        for (i in 0 until 4) {
+            if (i != targetIndex) {
+                playerManager.stopTile(i)
+            }
         }
-        _activeMultiviewChannels.value = currentList
-        playerManager.playChannel(index, channel, channel.streamUrl)
-        enterSolo(index)
+        val slots = emptyTileSlots().toMutableList()
+        slots[targetIndex] = channel
+        _activeMultiviewChannels.value = slots
+        _focusedTileIndex.value = targetIndex
+        _currentLayout.value = MultiviewLayoutType.SOLO
+        playChannelInTile(channel, targetIndex)
+        playerManager.setAudioTile(targetIndex)
+        _isPlaying.value = true
         _currentSection.value = TvScreenSection.MULTIVIEW
     }
 
     fun assignChannelToTile(channel: TabloChannel, tileIndex: Int) {
-        val currentList = _activeMultiviewChannels.value.toMutableList()
-        while (currentList.size <= tileIndex) {
-            currentList.add(channel)
+        val idx = tileIndex.coerceIn(0, 3)
+        playChannelInTile(channel, idx)
+        setFocusedTile(idx)
+        if (_currentLayout.value == MultiviewLayoutType.SOLO) {
+            _currentLayout.value = MultiviewLayoutType.HORIZONTAL_2_UP
         }
-        currentList[tileIndex] = channel
-        _activeMultiviewChannels.value = currentList
-        playerManager.playChannel(tileIndex, channel, channel.streamUrl)
-        setFocusedTile(tileIndex)
+        _isPlaying.value = true
         _currentSection.value = TvScreenSection.MULTIVIEW
+    }
+
+    fun removeChannelFromTile(tileIndex: Int) {
+        if (tileIndex in 0..3) {
+            val slots = _activeMultiviewChannels.value.toMutableList()
+            if (tileIndex < slots.size) {
+                slots[tileIndex] = null
+                _activeMultiviewChannels.value = slots
+            }
+            playerManager.stopTile(tileIndex)
+            _tileErrors.value = _tileErrors.value - tileIndex
+            val filled = slots.mapIndexedNotNull { index, ch -> if (ch != null) index else null }
+            if (filled.isNotEmpty() && _focusedTileIndex.value == tileIndex) {
+                setFocusedTile(filled.first())
+            }
+        }
+    }
+
+    fun togglePlayPause() {
+        val currentFocus = _focusedTileIndex.value
+        val playing = playerManager.togglePlayPause(currentFocus)
+        _isPlaying.value = playing
+    }
+
+    fun goToLive() {
+        val currentFocus = _focusedTileIndex.value
+        playerManager.goToLive(currentFocus)
+        _isPlaying.value = true
+    }
+
+    fun setMultiviewChannelsCount(count: Int) {
+        when (count) {
+            1 -> {
+                _currentLayout.value = MultiviewLayoutType.SOLO
+            }
+            2 -> {
+                _currentLayout.value = MultiviewLayoutType.HORIZONTAL_2_UP
+            }
+            3 -> {
+                _currentLayout.value = MultiviewLayoutType.PRIMARY_1_PLUS_2
+            }
+            4 -> {
+                _currentLayout.value = MultiviewLayoutType.GRID_2X2
+            }
+        }
     }
 
     fun saveCurrentMultiview(name: String) {
@@ -210,7 +362,7 @@ class TabloViewModel(application: Application) : AndroidViewModel(application) {
             val item = SavedMultiviewItem(
                 name = name,
                 layoutType = _currentLayout.value,
-                channels = _activeMultiviewChannels.value,
+                channels = _activeMultiviewChannels.value.filterNotNull(),
                 preferredAudioChannelId = focusedChannel?.channelId ?: ""
             )
             savedRepository.saveMultiview(item)
@@ -219,9 +371,9 @@ class TabloViewModel(application: Application) : AndroidViewModel(application) {
 
     fun loadSavedMultiview(item: SavedMultiviewItem) {
         viewModelScope.launch {
-            _activeMultiviewChannels.value = item.channels
+            _activeMultiviewChannels.value = List(4) { index -> item.channels.getOrNull(index) }
             item.channels.forEachIndexed { index, channel ->
-                playerManager.playChannel(index, channel, channel.streamUrl)
+                playChannelInTile(channel, index)
             }
             _currentLayout.value = item.layoutType
             val prefIndex = item.channels.indexOfFirst { it.channelId == item.preferredAudioChannelId }
@@ -247,11 +399,16 @@ class TabloViewModel(application: Application) : AndroidViewModel(application) {
     fun startDiscovery() {
         viewModelScope.launch {
             _isScanning.value = true
+            _connectionError.value = null
             try {
                 val devices = tabloRepository.discoverDevices()
                 _discoveredDevices.value = devices
+                if (devices.isEmpty()) {
+                    _connectionError.value = "Tablo not found. Make sure your Tablo and Fire TV are connected to the same network."
+                }
             } catch (e: Exception) {
                 Log.e("TabloViewModel", "Discovery error: ${e.message}")
+                _connectionError.value = "Tablo not found. Make sure your Tablo and Fire TV are connected to the same network."
             } finally {
                 _isScanning.value = false
             }
@@ -260,38 +417,100 @@ class TabloViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectDevice(device: TabloDevice) {
         viewModelScope.launch {
-            _tabloDevice.value = device
+            val connected = device.copy(isConnected = true)
+            deviceRepository.save(connected)
+            _tabloDevice.value = connected
+            _currentSection.value = TvScreenSection.GUIDE
+            loadChannelsAndGuide(connected)
+        }
+    }
+
+    fun loginTabloAccount(email: String, password: String) {
+        viewModelScope.launch {
+            _isLoggingIn.value = true
+            _loginError.value = null
+            _connectionError.value = null
             try {
-                val remoteChannels = tabloRepository.fetchLiveChannels(device)
-                if (remoteChannels.isNotEmpty()) {
-                    _channels.value = remoteChannels
-                    val airings = tabloRepository.fetchLiveAirings(device, remoteChannels.map { it.channelId })
-                    if (airings.isNotEmpty()) {
-                        _airings.value = airings
+                when (val result = tabloRepository.loginTabloAccount(email, password)) {
+                    is TabloResult.Success -> {
+                        val devices = result.data
+                        _discoveredDevices.value = devices
+                        if (devices.size == 1) {
+                            selectDevice(devices.first())
+                        }
                     }
-                    _activeMultiviewChannels.value = remoteChannels.take(4)
-                    remoteChannels.take(4).forEachIndexed { i, ch ->
-                        val watchUrl = tabloRepository.fetchWatchStreamUrl(device, ch)
-                        playerManager.playChannel(i, ch, watchUrl)
+                    is TabloResult.Error -> {
+                        _loginError.value = result.message
                     }
                 }
             } catch (e: Exception) {
-                Log.e("TabloViewModel", "Error tuning to device: ${e.message}")
+                Log.e("TabloViewModel", "Login error: ${e.message}")
+                _loginError.value = e.message ?: "Login failed. Please check network connection."
+            } finally {
+                _isLoggingIn.value = false
             }
         }
     }
 
-    fun connectDirectIp(ip: String) {
+    fun connectDirectIp(ip: String, port: Int = 8885) {
         viewModelScope.launch {
-            val device = tabloRepository.fetchServerInfo(ip) ?: discoveryManager.connectDirectIp(ip)
-            if (device != null) {
+            lastManualIp = ip.trim()
+            _isConnecting.value = true
+            _connectionError.value = null
+            val device = tabloRepository.fetchServerInfo(ip.trim(), port)
+            _isConnecting.value = false
+            if (device == null) {
+                _connectionError.value = "Tablo not found at ${ip.trim()}:$port. Check the IP and make sure the device is powered on."
+            } else {
                 selectDevice(device)
             }
+        }
+    }
+
+    fun retryConnection() {
+        val device = _tabloDevice.value
+        if (device != null && device.isConnected) {
+            loadChannelsAndGuide(device)
+        } else if (!lastManualIp.isNullOrBlank()) {
+            connectDirectIp(lastManualIp!!)
+        } else {
+            startDiscovery()
+        }
+    }
+
+    fun refreshGuide() {
+        val device = _tabloDevice.value ?: return
+        loadGuide(device, _channels.value)
+    }
+
+    fun disconnect() {
+        viewModelScope.launch {
+            playerManager.releaseAll()
+            deviceRepository.clear()
+            _tabloDevice.value = null
+            _channels.value = emptyList()
+            _airings.value = emptyList()
+            _activeMultiviewChannels.value = emptyTileSlots()
+            _discoveredDevices.value = emptyList()
+            _channelError.value = null
+            _guideError.value = null
+            _connectionError.value = null
+            _tileErrors.value = emptyMap()
+            _isLoadingChannels.value = false
+            _isLoadingGuide.value = false
+            _currentSection.value = TvScreenSection.TABLO
+            lastManualIp = null
         }
     }
 
     override fun onCleared() {
         super.onCleared()
         playerManager.releaseAll()
+    }
+
+    private companion object {
+        const val STREAM_ERROR_MESSAGE = "Unable to start stream. Check that a tuner is free and the Tablo is reachable."
+
+        fun emptyTileSlots(): List<TabloChannel?> = List(4) { null }
     }
 }

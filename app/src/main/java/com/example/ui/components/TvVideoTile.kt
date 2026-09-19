@@ -11,6 +11,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,7 +23,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
@@ -50,8 +50,6 @@ import androidx.media3.ui.PlayerView
 import com.example.model.TabloAiring
 import com.example.model.TabloChannel
 import com.example.ui.theme.ActiveAudioBorderColor
-import com.example.ui.theme.LiveRed
-import com.example.ui.theme.TabloTeal
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.TvBackground
@@ -72,23 +70,21 @@ fun TvVideoTile(
 ) {
     val context = LocalContext.current
 
-    // Deterministic subtle border when focused; no dark/mute overlay on inactive feeds
+    // Deterministic subtle gray border when focused; no dark/mute overlay on inactive feeds
     val borderStroke = if (isAudioFocused) {
-        BorderStroke(2.5.dp, ActiveAudioBorderColor.copy(alpha = 0.92f))
+        BorderStroke(2.dp, ActiveAudioBorderColor)
     } else {
-        BorderStroke(1.dp, Color(0x22FFFFFF))
+        BorderStroke(1.dp, Color(0x1AFFFFFF))
     }
 
     val baseModifier = modifier
         .fillMaxSize()
         .clip(RoundedCornerShape(4.dp))
         .border(borderStroke, RoundedCornerShape(4.dp))
-        .onFocusChanged { focusState ->
-            if (focusState.isFocused) {
-                onFocused()
-            }
+        .clickable {
+            onFocused()
+            onSelect()
         }
-        .focusable()
 
     val combinedModifier = if (focusRequester != null) {
         baseModifier.focusRequester(focusRequester)
@@ -147,14 +143,18 @@ fun TvVideoTile(
                     Box(
                         modifier = Modifier
                             .background(
-                                color = if (isAudioFocused) TabloTeal.copy(alpha = 0.85f) else Color(0x661E293B),
+                                color = if (isAudioFocused) Color(0xD91E293B) else Color(0x661E293B),
+                                shape = RoundedCornerShape(4.dp)
+                            )
+                            .border(
+                                border = if (isAudioFocused) BorderStroke(1.dp, ActiveAudioBorderColor.copy(alpha = 0.6f)) else BorderStroke(0.5.dp, Color(0x33FFFFFF)),
                                 shape = RoundedCornerShape(4.dp)
                             )
                             .padding(horizontal = 8.dp, vertical = 3.dp)
                     ) {
                         Text(
                             text = "${channel.displayChannel} ${channel.network}",
-                            color = if (isAudioFocused) Color.Black else TextPrimary,
+                            color = TextPrimary,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -173,29 +173,6 @@ fun TvVideoTile(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f)
                     )
-
-                    Spacer(modifier = Modifier.width(8.dp))
-
-                    // Subtle LIVE Indicator
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .background(Color(0x33000000), RoundedCornerShape(3.dp))
-                            .padding(horizontal = 6.dp, vertical = 2.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(6.dp)
-                                .background(LiveRed, CircleShape)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "LIVE",
-                            color = Color.White,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.ExtraBold
-                        )
-                    }
                 }
             }
         }

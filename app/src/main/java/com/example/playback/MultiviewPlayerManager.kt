@@ -22,20 +22,16 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import com.example.model.TabloChannel
 
 @OptIn(UnstableApi::class)
-class MultiviewPlayerManager(private val context: Context) {
+class MultiviewPlayerManager(
+    private val context: Context,
+    private val onPlayerError: (Int, String) -> Unit
+) {
     private val maxStreams = 4
     private val players = mutableMapOf<Int, ExoPlayer>()
     private val currentUrls = mutableMapOf<Int, String>()
     private val retryCounts = mutableMapOf<Int, Int>()
     private val handler = Handler(Looper.getMainLooper())
     private var focusedTileIndex = 0
-
-    // Reliable fallback stream
-    private val fallbackStreamUrl = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
-
-    init {
-        // Players are initialized lazily on-demand when assigned channels
-    }
 
     fun getPlayer(tileIndex: Int): ExoPlayer {
         return getOrCreatePlayer(tileIndex)
@@ -81,7 +77,7 @@ class MultiviewPlayerManager(private val context: Context) {
             .setMediaSourceFactory(mediaSourceFactory)
             .setLoadControl(loadControl)
             .build().apply {
-                repeatMode = Player.REPEAT_MODE_ALL
+                repeatMode = Player.REPEAT_MODE_OFF
                 playWhenReady = true
                 val isFocused = (tileIndex == focusedTileIndex)
                 volume = if (isFocused) 1.0f else 0.0f
@@ -104,24 +100,29 @@ class MultiviewPlayerManager(private val context: Context) {
                             "MultiviewPlayer",
                             "Playback error on tile $tileIndex (attempt $currentRetry): ${error.errorCodeName} - ${error.message}"
                         )
-                        val activeUrl = currentUrls[tileIndex] ?: fallbackStreamUrl
+                        val activeUrl = currentUrls[tileIndex]
+                        if (activeUrl == null) {
+                            onPlayerError(tileIndex, error.message ?: "Stream error")
+                            return
+                        }
                         if (currentRetry < 2) {
                             retryCounts[tileIndex] = currentRetry + 1
                             handler.postDelayed({
-                                if (players[tileIndex] != null) {
-                                    stop()
-                                    setMediaItem(MediaItem.fromUri(activeUrl))
-                                    prepare()
-                                    play()
+                                val p = players[tileIndex]
+                                if (p != null) {
+                                    try {
+                                        p.stop()
+                                        p.setMediaItem(MediaItem.fromUri(activeUrl))
+                                        p.prepare()
+                                        p.play()
+                                    } catch (e: Exception) {
+                                        Log.e("MultiviewPlayer", "Error retrying tile $tileIndex: ${e.message}")
+                                    }
                                 }
                             }, 1500L)
                         } else {
-                            Log.e("MultiviewPlayer", "Tile $tileIndex exceeded max retries. Switching to fallback stream.")
-                            currentUrls[tileIndex] = fallbackStreamUrl
-                            stop()
-                            setMediaItem(MediaItem.fromUri(fallbackStreamUrl))
-                            prepare()
-                            play()
+                            Log.e("MultiviewPlayer", "Tile $tileIndex exceeded max retries")
+                            onPlayerError(tileIndex, error.message ?: "Unable to play stream")
                         }
                     }
                 })
@@ -214,6 +215,53 @@ class MultiviewPlayerManager(private val context: Context) {
 
     fun resumeAll() {
         players.values.forEach { it.play() }
+    }
+
+    fun stopTile(tileIndex: Int) {
+        try {
+            val player = players[tileIndex]
+            if (player != null) {
+                player.stop()
+                player.clearMediaItems()
+            }
+            currentUrls.remove(tileIndex)
+            retryCounts.remove(tileIndex)
+        } catch (e: Exception) {
+            Log.e("MultiviewPlayer", "Error stopping tile $tileIndex: ${e.message}")
+        }
+    }
+
+    fun togglePlayPause(tileIndex: Int): Boolean {
+        val player = players[tileIndex] ?: return false
+        return if (player.isPlaying) {
+            player.pause()
+            false
+        } else {
+            player.play()
+            true
+        }
+    }
+
+    fun isPlaying(tileIndex: Int): Boolean {
+        return players[tileIndex]?.isPlaying == true
+    }
+
+    fun play(tileIndex: Int) {
+        players[tileIndex]?.play()
+    }
+
+    fun pause(tileIndex: Int) {
+        players[tileIndex]?.pause()
+    }
+
+    fun goToLive(tileIndex: Int) {
+        val player = players[tileIndex] ?: return
+        try {
+            player.seekToDefaultPosition()
+            player.play()
+        } catch (e: Exception) {
+            Log.e("MultiviewPlayer", "Error seeking to live on tile $tileIndex: ${e.message}")
+        }
     }
 
     fun releaseAll() {
